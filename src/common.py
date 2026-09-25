@@ -130,3 +130,41 @@ def script_of(s: str) -> str:
     if len(ranked) > 1 and ranked[1][1] / total >= 0.2:
         return "mixed"
     return ranked[0][0]
+
+
+# ----------------------------------------------------------------------------- processed tables
+
+def nn(v):
+    """Text value or None. pandas 3 stores missing text as NaN, pandas 2 as None; this makes
+    both look the same to pure-Python code."""
+    return v if isinstance(v, str) else None
+
+
+def write_table(df: pd.DataFrame, path_no_ext: Path) -> Path:
+    """Parquet if pyarrow is installed, else gzipped TSV (fallback)."""
+    path_no_ext = Path(path_no_ext)
+    try:
+        import pyarrow  # noqa: F401
+        p = path_no_ext.with_suffix(".parquet")
+        df.to_parquet(p, index=False)
+    except ImportError:
+        p = path_no_ext.with_suffix(".tsv.gz")
+        df.to_csv(p, sep="\t", index=False)
+    return p
+
+
+def read_table(path_no_ext: Path, columns: list[str] | None = None) -> pd.DataFrame:
+    """Read a table written by write_table. Empty strings from the TSV fallback become None
+    and *_missing columns become bool, so both formats load identically."""
+    path_no_ext = Path(path_no_ext)
+    pq = path_no_ext.with_suffix(".parquet")
+    if pq.exists():
+        return pd.read_parquet(pq, columns=columns)
+    df = pd.read_csv(path_no_ext.with_suffix(".tsv.gz"), sep="\t", dtype=str,
+                     keep_default_na=False, usecols=columns)
+    for c in df.columns:
+        if c.endswith("_missing"):
+            df[c] = df[c] == "True"
+        else:
+            df[c] = df[c].astype(object).where(df[c] != "", None)
+    return df
