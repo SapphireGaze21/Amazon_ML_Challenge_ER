@@ -1,6 +1,10 @@
 dataset/
 data_parquet/
+data_clean/
+data_repr/
 artifacts/
 *.zip
 *.tsv
 *.parquet
+*.tsv.gz
+__pycache__/
