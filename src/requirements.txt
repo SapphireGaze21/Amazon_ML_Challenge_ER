@@ -1,0 +1,4 @@
+pandas>=2.1,<4
+numpy>=1.24
+pyarrow>=14
+rapidfuzz>=3.0
