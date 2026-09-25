@@ -1,0 +1,6 @@
+dataset/
+data_parquet/
+artifacts/
+*.zip
+*.tsv
+*.parquet
