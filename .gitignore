@@ -8,3 +8,4 @@ artifacts/
 *.parquet
 *.tsv.gz
 __pycache__/
+data_cand/
