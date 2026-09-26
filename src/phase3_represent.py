@@ -38,7 +38,7 @@ import pandas as pd
 from common import char_ngrams, nn, read_table, write_table
 from represent import (ABBR_ADDRESS_HAND, ABBR_NAME_HAND, LEGAL_SUFFIX_HAND, REPR_COLUMNS,
                        SubstitutionMiner, address_token_list, build_repr, build_repr_chunk,
-                       init_config, name_mining_tokens)
+                       init_config, merge_maps, name_mining_tokens, suffix_like)
 from romanize import has_unsupported_script
 
 T0 = time.time()
@@ -130,12 +130,14 @@ def decide_suffixes(n_names, pos_present, tail, pair_present, dropped, n_pairs_c
                 ok, why = True, "hand"
             elif not t.isalpha():
                 ok, why = False, "not alphabetic"
+            elif not suffix_like(t, LEGAL_SUFFIX_HAND):
+                ok, why = False, "rejected (not abbreviation-length, not a legal-word variant)"
             elif labeled:
-                ok = (len(t) <= 6 and share_tail >= a.suffix_min_share and p_tail >= 0.7
+                ok = (share_tail >= a.suffix_min_share and p_tail >= 0.7
                       and drop is not None and drop >= a.suffix_min_drop)
                 why = "discovered (position + droppability)" if ok else "rejected"
             else:
-                ok = len(t) <= 5 and share_tail >= a.suffix_min_share_unlabeled and p_tail >= 0.85
+                ok = share_tail >= a.suffix_min_share_unlabeled and p_tail >= 0.85
                 why = "discovered (position only, unlabeled country)" if ok else "rejected"
             if ok:
                 accepted.add(t)
@@ -339,10 +341,14 @@ def main():
     abbr_addr_m, addr_rows = addr_m.result(a.min_abbr_count, a.min_abbr_share)
     phrase_m, phrase_rows = addr_m.phrase_result(a.min_abbr_count)
     countries = set(n_names)
-    cfg = {"suffix": suffix,
-           "phrase_address": {c: phrase_m.get(c, {}) for c in countries},
-           "abbr_name": {c: {**ABBR_NAME_HAND, **abbr_name_m.get(c, {})} for c in countries},
-           "abbr_address": {c: {**ABBR_ADDRESS_HAND, **abbr_addr_m.get(c, {})} for c in countries}}
+    dropped_abbr = []
+    cfg = {"suffix": suffix, "phrase_address": {c: phrase_m.get(c, {}) for c in countries},
+           "abbr_name": {}, "abbr_address": {}}
+    for c in countries:
+        for kind, hand, mined in (("name", ABBR_NAME_HAND, abbr_name_m),
+                                  ("address", ABBR_ADDRESS_HAND, abbr_addr_m)):
+            cfg[f"abbr_{kind}"][c], d = merge_maps(hand, mined.get(c, {}))
+            dropped_abbr += [(c, kind) + x for x in d]
     # a mined abbreviation must not map a legal suffix away before suffix removal sees it
     for c in countries:
         cfg["abbr_name"][c] = {s: l for s, l in cfg["abbr_name"][c].items() if s not in cfg["suffix"][c]}
@@ -372,6 +378,7 @@ def main():
                   f, indent=1, ensure_ascii=False)
     report["suffixes_discovered"] = {c: sorted(s - LEGAL_SUFFIX_HAND) for c, s in suffix.items()}
     report["abbr_mined_accepted"] = {"name": abbr_name_m, "address": abbr_addr_m}
+    report["abbr_dropped_conflicts"] = dropped_abbr
     report["phrases_mined_accepted"] = {c: {" ".join(w): s for w, s in m.items()}
                                         for c, m in phrase_m.items()}
     report["mining_pairs_by_country"] = dict(n_pairs_c)
