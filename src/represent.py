@@ -62,7 +62,8 @@ LEGAL_SUFFIX_HAND |= {t for w in NATIVE_LEGAL for t in romanize(w).split() if le
 # Removed only at the START of a name.
 HONORIFICS = {"mr", "mrs", "ms", "dr", "smt", "shri", "sri", "shree", "sree", "messrs", "mme",
               "mlle", "kumari", "km"}
-CONNECTORS = {"and", "et", "the", "und"}
+# Phase 3 report: "of" was a top-5 US core token, "de"/"du" top French ones
+CONNECTORS = {"and", "et", "the", "und", "of", "de", "du", "des", "la", "le", "les"}
 ALIAS_MARKERS = {"dba", "fka", "aka", "formerly"}
 
 ABBR_ADDRESS_HAND = {
@@ -322,6 +323,42 @@ def build_repr_chunk(chunk):
 
 
 # ----------------------------------------------------------------------------- mining helpers
+
+def merge_maps(hand: dict, mined: dict) -> tuple[dict, list]:
+    """Merge hand + mined abbreviation maps safely.
+    - a mined entry that reverses a hand entry is dropped (Phase 3 report: mined
+      kerala->keralam vs hand keralam->kerala made the two spellings swap instead of merge)
+    - chains a->b->c are collapsed to a->c; anything still cyclic is dropped.
+    Returns (map, dropped_entries)."""
+    m, dropped = dict(hand), []
+    for s, l in mined.items():
+        if s == l:
+            continue
+        if m.get(l) == s:
+            dropped.append((s, l, "reverses hand entry"))
+            continue
+        m[s] = l
+    out = {}
+    for k, v in m.items():
+        seen, cur = {k}, v
+        while cur in m and cur not in seen:
+            seen.add(cur)
+            cur = m[cur]
+        if cur in seen:
+            dropped.append((k, v, "cycle"))
+            continue
+        out[k] = cur
+    return out, dropped
+
+
+def suffix_like(tok: str, hand: set) -> bool:
+    """Could tok plausibly be a legal form? Abbreviation length (pa, od, ei, pra, li) or the same
+    phonetic key as a known legal word of 4+ letters (limtid ~ limited, elelpi ~ elaelpi).
+    Phase 3 showed that frequency/droppability alone also admits descriptors (bakery, church)."""
+    if len(tok) <= 3:
+        return True
+    k = phonetic_key(tok)
+    return k is not None and k in {phonetic_key(h) for h in hand if len(h) >= 4}
 
 def is_subsequence(short: str, long: str) -> bool:
     it = iter(long)
