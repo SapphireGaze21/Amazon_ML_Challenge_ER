@@ -4,12 +4,13 @@ Phase 5 - Blocking (candidate generation).
 
 Passes, unioned per S1 (country-partitioned):
   exact_sorted / exact_concat / exact_alias   hash joins on the Phase 3 exact keys
-  sparse_comb   top-K by  w_name*cos(name features) + w_addr*cos(address features)
-  sparse_name   top-K by the name score alone      (matches whose address is missing/different)
-  sparse_addr   top-K by the address score alone   (matches whose name is different: DBA etc.)
-  char_name     top-K by char n-gram TF-IDF cosine on the glued name (typos, squashed names)
-Candidates are merged, ranked by priority (see blocking.merge_candidates) and trimmed to a
-per-S1 budget.
+  sparse_comb   top-K by name + address + name-x-address cross features (capped IDF cosines)
+  sparse_name   top-K by name alone      (matches whose address is missing/different)
+  sparse_addr   top-K by address alone   (matches whose name is different: DBA, noise)
+  char_name     top-K by char 3-grams of the glued name (typos, squashed names)
+  char_addr     top-K by char 3-grams of the address    (typos in street / city names)
+Every union candidate is then re-ranked with FULL (uncapped) cosines of all five feature
+groups (see blocking.py) and trimmed to a per-S1 budget.
 
 Splits
   --split val    S1 = validation split, pool = train S2+S3  -> the numbers we report
@@ -48,15 +49,17 @@ def log(msg):
     print(f"[{time.time() - T0:7.0f}s] {msg}", flush=True)
 
 
-def build_features(df: pd.DataFrame, workers: int, chunk: int = 50_000):
+def build_features(df: pd.DataFrame, workers: int, chunk: int = 50_000) -> dict:
     rows = list(zip(df.name_core, df.name_phon, df.address_tokens_norm, df.address_nums,
-                    df.address_numcompounds))
+                    df.address_numcompounds, df.name_concat))
     parts = [rows[i:i + chunk] for i in range(0, len(rows), chunk)]
-    nl, ni, al, ai = [], [], [], []
+    acc = {g: ([], []) for g in B.GROUPS}
     with Pool(workers) as p:
-        for a, b, c, d in p.imap(B.feature_chunk, parts):
-            nl.append(a); ni.append(b); al.append(c); ai.append(d)  # noqa: E702
-    return B.csr_from_parts(nl, ni), B.csr_from_parts(al, ai)
+        for res in p.imap(B.feature_chunk, parts):
+            for g, (l, i) in res.items():
+                acc[g][0].append(l)
+                acc[g][1].append(i)
+    return {g: B.csr_from_parts(l, i) for g, (l, i) in acc.items()}
 
 
 def f05(r):
@@ -76,16 +79,17 @@ def main():
     ap.add_argument("--s1-sample", type=int, default=0, help="0 = all S1 of the split")
     ap.add_argument("--countries", default=None, help="comma list, default all")
     ap.add_argument("--max-df", type=int, default=5000, help="drop hashed features more common than this")
-    ap.add_argument("--k-comb", type=int, default=100)
+    ap.add_argument("--k-comb", type=int, default=150)
     ap.add_argument("--k-name", type=int, default=50)
     ap.add_argument("--k-addr", type=int, default=50)
-    ap.add_argument("--k-char", type=int, default=50)
-    ap.add_argument("--no-char", action="store_true")
-    ap.add_argument("--char-ngram", type=int, default=3)
-    ap.add_argument("--char-max-df", type=int, default=5000)
+    ap.add_argument("--k-char-name", type=int, default=50, help="0 disables the pass")
+    ap.add_argument("--k-char-addr", type=int, default=50, help="0 disables the pass")
     ap.add_argument("--w-name", type=float, default=1.0)
     ap.add_argument("--w-addr", type=float, default=1.0)
-    ap.add_argument("--min-score", type=float, default=0.0)
+    ap.add_argument("--w-cross", type=float, default=0.5)
+    ap.add_argument("--w-cname", type=float, default=0.5)
+    ap.add_argument("--w-caddr", type=float, default=0.5)
+    ap.add_argument("--w-exact", type=float, default=0.25)
     ap.add_argument("--exact-max-block", type=int, default=5000)
     ap.add_argument("--budget-max", type=int, default=200, help="candidates kept per S1 on disk")
     ap.add_argument("--budgets", default="10,25,50,100,200,300")
@@ -133,19 +137,14 @@ def main():
         pc = pool[pool.country_norm == c].reset_index(drop=True)
         log(f"== {c}: S1 {len(s1c):,}  pool {len(pc):,}")
 
-        # ---- features
-        B_n, B_a = build_features(pc, a.workers)
-        A_n, A_a = build_features(s1c, a.workers)
-        info = {"name": B.idf_weight(A_n, B_n, a.max_df), "addr": B.idf_weight(A_a, B_a, a.max_df)}
-        BT_n, BT_a = B_n.T.tocsr(), B_a.T.tocsr()
-        del B_n, B_a
-        A_ch = BT_ch = None
-        if not a.no_char:
-            A_ch, B_ch, ci = B.char_vectors(pc.name_concat.tolist(), s1c.name_concat.tolist(),
-                                            a.char_ngram, a.char_max_df)
-            BT_ch = B_ch.T.tocsr()
-            del B_ch
-            info["char"] = ci
+        # ---- features (5 groups, capped for generation + full for re-ranking)
+        Fp, Fs = build_features(pc, a.workers), build_features(s1c, a.workers)
+        M, info = {}, {}
+        for g in B.GROUPS:
+            A_cap, B_cap, A_full, B_full, info[g] = B.weighted(Fs[g], Fp[g], a.max_df)
+            M[g] = {"A_cap": A_cap, "BT_cap": B_cap.T.tocsr(), "A_full": A_full, "B_full": B_full}
+            del B_cap
+        del Fp, Fs
         build_info[c] = info
         log(f"   features built {info}")
 
@@ -158,26 +157,20 @@ def main():
         ex["exact_alias"] = (np.concatenate([r1, r2]), np.concatenate([c1, c2]))
         log("   exact passes done " + str({k: len(v[0]) for k, v in ex.items()}))
 
-        # ---- sparse + char passes, chunked
+        # ---- generation + union + re-ranking in workers, chunked
         B.G.clear()
-        B.G.update(A_n=A_n, A_a=A_a, BT_n=BT_n, BT_a=BT_a, A_ch=A_ch, BT_ch=BT_ch,
-                   w_name=a.w_name, w_addr=a.w_addr, min_score=a.min_score,
-                   k_comb=a.k_comb, k_name=a.k_name, k_addr=a.k_addr, k_char=a.k_char)
+        B.G.update(M=M, exact=ex, n_pool=len(pc),
+                   k={"sparse_comb": a.k_comb, "sparse_name": a.k_name, "sparse_addr": a.k_addr,
+                      "char_name": a.k_char_name, "char_addr": a.k_char_addr},
+                   w={"name": a.w_name, "addr": a.w_addr, "cross": a.w_cross, "cname": a.w_cname,
+                      "caddr": a.w_caddr, "exact": a.w_exact})
         pos_of = {e: i for i, e in enumerate(pc.entity_id)}
         with Pool(a.workers) as wp:
             for ci_, lo in enumerate(range(0, len(s1c), a.chunk)):
                 hi = min(lo + a.chunk, len(s1c))
                 bounds = [(x, min(x + a.sub, hi)) for x in range(lo, hi, a.sub)]
-                acc = {}
-                for res in wp.imap(B.sparse_worker, bounds):
-                    for k, v in res.items():
-                        acc.setdefault(k, []).append(v)
-                parts = [(k, np.concatenate([v[0] for v in vs]), np.concatenate([v[1] for v in vs]),
-                          np.concatenate([v[2] for v in vs])) for k, vs in acc.items()]
-                for k, (r, cc) in ex.items():
-                    m = (r >= lo) & (r < hi)
-                    parts.append((k, r[m], cc[m], np.ones(int(m.sum()), np.float32)))
-                cand = B.merge_candidates(parts, len(pc))       # full union, ranked
+                res = list(wp.imap(B.block_worker, bounds))
+                cand = pd.DataFrame({k_: np.concatenate([r[k_] for r in res]) for k_ in res[0]})
                 n_union = cand.groupby("s1").size()
 
                 # ---- write shard (trimmed to --budget-max per S1)
@@ -219,7 +212,7 @@ def main():
                         true_rows.append(T)
                 log(f"   chunk {ci_}: S1 {lo:,}-{hi:,}  union {len(cand):,}  kept {len(shard):,}")
         B.G.clear()
-        del A_n, A_a, BT_n, BT_a, A_ch, BT_ch
+        del M
 
     if tsv is not None:
         tsv.close()
