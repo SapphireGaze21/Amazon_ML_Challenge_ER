@@ -29,10 +29,15 @@ Outputs
   {cand-dir}/{run}/{country}_{chunk}.parquet   candidates with passes, scores, priority, rank
   {out-dir}/{run}/candidate_pairs.tsv          (test) README format, final budget applied
 
+Scale: every worker writes its own candidate shard and returns only small summaries (no
+candidate rows travel back to the main process); pool features can be cached on disk with
+--feature-cache so the val and train runs (same pool) build them once.
+
 Usage
   python src/phase5_blocking.py --split val --s1-sample 50000      # quick experiment
-  python src/phase5_blocking.py --split val                        # full validation
-  python src/phase5_blocking.py --split test                       # submission candidates
+  python src/phase5_blocking.py --split val  --feature-cache data_cache
+  python src/phase5_blocking.py --split train --s1-sample 400000 --feature-cache data_cache
+  python src/phase5_blocking.py --split test --feature-cache data_cache
 """
 
 import argparse
@@ -44,6 +49,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 
 import blocking as B
 from common import read_table, write_table
@@ -66,6 +72,71 @@ def build_features(df: pd.DataFrame, workers: int, chunk: int = 50_000) -> dict:
                 acc[g][0].append(l)
                 acc[g][1].append(i)
     return {g: B.csr_from_parts(l, i) for g, (l, i) in acc.items()}
+
+
+def pool_features(pc: pd.DataFrame, workers: int, cache_dir, key: str, rebuild: bool) -> dict:
+    """Raw hashed pool features, cached on disk (the val and train runs share the pool).
+    Delete the cache folder whenever data_block or the feature code changes."""
+    if cache_dir:
+        cache_dir = Path(cache_dir)
+        paths = {g: cache_dir / f"{key}_{g}.npz" for g in B.GROUPS}
+        if not rebuild and all(p.exists() for p in paths.values()):
+            F = {g: sp.load_npz(p).tocsr() for g, p in paths.items()}
+            if all(m.shape[0] == len(pc) for m in F.values()):
+                log(f"   pool features loaded from cache ({key})")
+                return F
+    F = build_features(pc, workers)
+    if cache_dir:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        for g, p in paths.items():
+            sp.save_npz(p, F[g], compressed=False)
+    return F
+
+
+def emit_worker(bounds):
+    """Runs in a worker: block S1 rows [lo, hi), write the trimmed candidates straight to a
+    shard, and return only small arrays (union sizes, ranks of true pairs, TSV lines)."""
+    lo, hi = bounds
+    g = B.G
+    out = B.block_worker(bounds)
+    s1, cand, rank, passes = out["s1"], out["cand"], out["rank"], out["passes"]
+    res = {"lo": lo, "hi": hi, "n_union": np.bincount(s1 - lo, minlength=hi - lo), "kept": 0}
+
+    ts, tc = g["t_s1"], g["t_cand"]                       # true pairs, sorted by s1
+    i0, i1 = np.searchsorted(ts, lo), np.searchsorted(ts, hi)
+    if i1 > i0:
+        tr = np.full(i1 - i0, -1, np.int64)
+        tp = np.zeros(i1 - i0, np.int64)
+        if len(s1):
+            ukey = s1.astype(np.int64) * g["n_pool"] + cand
+            order = np.argsort(ukey)
+            sk = ukey[order]
+            tkey = ts[i0:i1].astype(np.int64) * g["n_pool"] + np.maximum(tc[i0:i1], 0)
+            pos = np.minimum(np.searchsorted(sk, tkey), len(sk) - 1)
+            hit = (sk[pos] == tkey) & (tc[i0:i1] >= 0)
+            idx = order[pos]
+            tr = np.where(hit, rank[idx], -1)
+            tp = np.where(hit, passes[idx], 0)
+        res.update(t0=i0, t1=i1, t_rank=tr, t_passes=tp)
+
+    keep = rank < g["budget_max"]
+    if keep.any():
+        df = pd.DataFrame({"s1_id": g["s1_ids"][s1[keep]], "cand_id": g["pool_ids"][cand[keep]],
+                           "passes": passes[keep], "priority": out["priority"][keep],
+                           "rank": rank[keep], **{c: out[c][keep] for c in B.COS_COLS}})
+        write_table(df, g["shard_dir"] / f"{g['country']}_{lo:09d}")
+        res["kept"] = int(keep.sum())
+
+    if g["final_budget"]:                                   # test: candidate_pairs.tsv lines
+        fb = rank < g["final_budget"]
+        ids = g["pool_ids"][cand[fb]]
+        rows = s1[fb] - lo
+        buckets = [[] for _ in range(hi - lo)]
+        for r_, c_ in zip(rows, ids):
+            buckets[r_].append(c_)
+        names = g["s1_ids"]
+        res["tsv"] = "".join(f"{names[lo + j]}\t{','.join(b)}\n" for j, b in enumerate(buckets))
+    return res
 
 
 def f05(r):
@@ -112,8 +183,9 @@ def main():
     ap.add_argument("--budget-max", type=int, default=200, help="candidates kept per S1 on disk")
     ap.add_argument("--budgets", default="10,25,50,100,200,300")
     ap.add_argument("--final-budget", type=int, default=200, help="budget for candidate_pairs.tsv / misses")
-    ap.add_argument("--chunk", type=int, default=50_000, help="S1 rows merged/written at a time")
-    ap.add_argument("--sub", type=int, default=2_000, help="S1 rows per worker task")
+    ap.add_argument("--sub", type=int, default=2_000, help="S1 rows per worker task (lower = less memory)")
+    ap.add_argument("--feature-cache", default=None, help="folder to cache pool features in")
+    ap.add_argument("--rebuild-cache", action="store_true")
     ap.add_argument("--workers", type=int, default=os.cpu_count())
     ap.add_argument("--seed", type=int, default=23)
     a = ap.parse_args()
@@ -156,7 +228,8 @@ def main():
         log(f"== {c}: S1 {len(s1c):,}  pool {len(pc):,}")
 
         # ---- features (capped for generation + full for re-ranking)
-        Fp, Fs = build_features(pc, a.workers), build_features(s1c, a.workers)
+        Fp = pool_features(pc, a.workers, a.feature_cache, f"{src}_{c}", a.rebuild_cache)
+        Fs = build_features(s1c, a.workers)
         M, info, Bcap = {}, {}, {}
         for g in B.GROUPS:
             A_cap, B_cap, A_full, B_full, info[g], a_norm = B.weighted(Fs[g], Fp[g], a.max_df)
@@ -188,7 +261,17 @@ def main():
         ex["exact_alias"] = (np.concatenate([r1, r2]), np.concatenate([c1, c2]))
         log("   exact passes done " + str({k: len(v[0]) for k, v in ex.items()}))
 
-        # ---- generation + union + re-ranking in workers, chunked
+        # ---- true pairs for this country, sorted by S1 position
+        pos_of = {e: i for i, e in enumerate(pc.entity_id)}
+        t_s1, t_cand, t_other = [], [], []
+        if labeled:
+            for i, x in enumerate(s1c.entity_id):
+                for m in truth.get(x, []):
+                    t_s1.append(i); t_cand.append(pos_of.get(m, -1)); t_other.append(m)  # noqa: E702
+        t_s1 = np.asarray(t_s1, np.int64)
+        t_cand = np.asarray(t_cand, np.int64)
+
+        # ---- generation + union + re-ranking + shard writing, all in workers
         B.G.clear()
         B.G.update(M=M, exact=ex, n_pool=len(pc), sub=sub, name_info=name_info,
                    pool_addr_missing=pc.address_missing.to_numpy(bool),
@@ -199,54 +282,46 @@ def main():
                       "nonlatin_phon": a.k_nonlatin, "expand_prf": a.k_prf},
                    w={"name": a.w_name, "addr": a.w_addr, "cross": a.w_cross, "cname": a.w_cname,
                       "caddr": a.w_caddr, "exact": a.w_exact,
-                      "missing_addr_factor": a.missing_addr_factor})
-        pos_of = {e: i for i, e in enumerate(pc.entity_id)}
+                      "missing_addr_factor": a.missing_addr_factor},
+                   t_s1=t_s1, t_cand=t_cand, budget_max=a.budget_max,
+                   final_budget=a.final_budget if a.split == "test" else 0,
+                   s1_ids=s1c.entity_id.to_numpy(dtype=object), pool_ids=pc.entity_id.to_numpy(dtype=object),
+                   shard_dir=cand_dir, country=c)
+        n_cand = np.zeros(len(s1c), np.int64)
+        t_rank = np.full(len(t_s1), -1, np.int64)
+        t_pass = np.zeros(len(t_s1), np.int64)
+        bounds = [(x, min(x + a.sub, len(s1c))) for x in range(0, len(s1c), a.sub)]
+        done, kept, next_log = 0, 0, 0.1
         with Pool(a.workers) as wp:
-            for ci_, lo in enumerate(range(0, len(s1c), a.chunk)):
-                hi = min(lo + a.chunk, len(s1c))
-                bounds = [(x, min(x + a.sub, hi)) for x in range(lo, hi, a.sub)]
-                res = list(wp.imap(B.block_worker, bounds))
-                cand = pd.DataFrame({k_: np.concatenate([r[k_] for r in res]) for k_ in res[0]})
-                n_union = cand.groupby("s1").size()
-
-                # ---- write shard (trimmed to --budget-max per S1)
-                shard = cand[cand["rank"] < a.budget_max].copy()
-                shard.insert(0, "s1_id", s1c.entity_id.to_numpy()[shard.s1.to_numpy()])
-                shard.insert(1, "cand_id", pc.entity_id.to_numpy()[shard.cand.to_numpy()])
-                write_table(shard.drop(columns=["s1", "cand"]), cand_dir / f"{c}_{ci_:03d}")
-
-                # ---- test: candidate_pairs.tsv for this chunk (every S1 gets a line)
+            for res in wp.imap_unordered(emit_worker, bounds):
+                n_cand[res["lo"]:res["hi"]] = res["n_union"]
+                if "t0" in res:
+                    t_rank[res["t0"]:res["t1"]] = res["t_rank"]
+                    t_pass[res["t0"]:res["t1"]] = res["t_passes"]
                 if tsv is not None:
-                    keep = shard[shard["rank"] < a.final_budget]
-                    lists = keep.groupby("s1_id")["cand_id"].apply(",".join).to_dict()
-                    for sid in s1c.entity_id.to_numpy()[lo:hi]:
-                        tsv.write(f"{sid}\t{lists.get(sid, '')}\n")
+                    tsv.write(res["tsv"])
+                kept += res["kept"]
+                done += res["hi"] - res["lo"]
+                if done / len(s1c) >= next_log:
+                    log(f"   {done:,}/{len(s1c):,} S1 done, {kept:,} candidates written")
+                    next_log += 0.1
 
-                # ---- evaluation bookkeeping
-                ids = s1c.entity_id.to_numpy()[lo:hi]
-                s1_rows.append(pd.DataFrame({
-                    "s1": np.arange(lo, hi), "s1_id": ids, "country": c,
-                    "n_true": [len(truth.get(x, [])) for x in ids],
-                    "n_cand": n_union.reindex(np.arange(lo, hi), fill_value=0).to_numpy(),
-                    "pool_size": len(pc)}))
-                if labeled:
-                    tr = [(i, pos_of.get(m, -1), m) for i, x in zip(range(lo, hi), ids)
-                          for m in truth.get(x, [])]
-                    if tr:
-                        T = pd.DataFrame(tr, columns=["s1", "cand", "other_id"])
-                        T = T.merge(cand[["s1", "cand", "passes", "rank"]], on=["s1", "cand"], how="left")
-                        ok = T.cand >= 0
-                        T["country"] = c
-                        T["source"] = T.other_id.str[:2]
-                        T["s1_id"] = s1c.entity_id.to_numpy()[T.s1.to_numpy()]
-                        T["cross_script"] = False
-                        T.loc[ok, "cross_script"] = (s1c.name_script.to_numpy()[T.s1[ok].to_numpy()] !=
-                                                     pc.name_script.to_numpy()[T.cand[ok].to_numpy()])
-                        T["other_addr_missing"] = False
-                        T.loc[ok, "other_addr_missing"] = pc.address_missing.to_numpy()[T.cand[ok].to_numpy()].astype(bool)
-                        T["in_pool"] = ok
-                        true_rows.append(T)
-                log(f"   chunk {ci_}: S1 {lo:,}-{hi:,}  union {len(cand):,}  kept {len(shard):,}")
+        # ---- evaluation bookkeeping (small)
+        s1_rows.append(pd.DataFrame({
+            "s1_id": s1c.entity_id.to_numpy(), "country": c,
+            "n_true": np.bincount(t_s1, minlength=len(s1c)) if len(t_s1) else 0,
+            "n_cand": n_cand, "pool_size": len(pc)}))
+        if len(t_s1):
+            ok = t_cand >= 0
+            cs = np.zeros(len(t_s1), bool)
+            am = np.zeros(len(t_s1), bool)
+            cs[ok] = s1c.name_script.to_numpy()[t_s1[ok]] != pc.name_script.to_numpy()[t_cand[ok]]
+            am[ok] = pc.address_missing.to_numpy(bool)[t_cand[ok]]
+            true_rows.append(pd.DataFrame({
+                "s1_id": s1c.entity_id.to_numpy()[t_s1], "other_id": t_other, "country": c,
+                "source": [m[:2] for m in t_other],
+                "rank": np.where(t_rank >= 0, t_rank, np.inf), "passes": t_pass,
+                "cross_script": cs, "other_addr_missing": am, "in_pool": ok}))
         B.G.clear()
         del M, sub
 
