@@ -9,8 +9,14 @@ Passes, unioned per S1 (country-partitioned):
   sparse_addr   top-K by address alone   (matches whose name is different: DBA, noise)
   char_name     top-K by char 3-grams of the glued name (typos, squashed names)
   char_addr     top-K by char 3-grams of the address    (typos in street / city names)
-Every union candidate is then re-ranked with FULL (uncapped) cosines of all five feature
-groups (see blocking.py) and trimmed to a per-S1 budget.
+  sparse_phon   top-K by phonetic + coarse-phonetic features (typos, transliterations)
+  sparse_cross  top-K by name-key x address-word features alone (descriptor swaps)
+  noaddr_name   top-K within pool records WITHOUT an address (name + phon + char name)
+  nonlatin_phon top-K within pool records with NON-LATIN names (phon + coarse phon + address)
+  expand_prf    optional pseudo-relevance feedback from the strongest candidates (--k-prf)
+Every union candidate is then re-ranked with FULL (uncapped) cosines of all feature groups,
+name terms scaled by the S1 name's informativeness (see blocking.py), and trimmed to a
+per-S1 budget. Every missed true pair is categorised by cause in the report.
 
 Splits
   --split val    S1 = validation split, pool = train S2+S3  -> the numbers we report
@@ -90,6 +96,18 @@ def main():
     ap.add_argument("--w-cname", type=float, default=0.5)
     ap.add_argument("--w-caddr", type=float, default=0.5)
     ap.add_argument("--w-exact", type=float, default=0.25)
+    ap.add_argument("--k-phon", type=int, default=50)
+    ap.add_argument("--k-cross", type=int, default=50)
+    ap.add_argument("--k-noaddr", type=int, default=50)
+    ap.add_argument("--k-nonlatin", type=int, default=50)
+    ap.add_argument("--k-prf", type=int, default=0, help="PRF expansion; 0 = off")
+    ap.add_argument("--prf-seeds", type=int, default=3)
+    ap.add_argument("--prf-min", type=float, default=1.5, help="min priority for a seed")
+    ap.add_argument("--prf-alpha", type=float, default=1.0)
+    ap.add_argument("--missing-addr-factor", type=float, default=0.7)
+    ap.add_argument("--info-floor", type=float, default=0.3,
+                    help="lowest name-informativeness multiplier (common one-word names)")
+    ap.add_argument("--dump-misses", type=int, default=2000)
     ap.add_argument("--exact-max-block", type=int, default=5000)
     ap.add_argument("--budget-max", type=int, default=200, help="candidates kept per S1 on disk")
     ap.add_argument("--budgets", default="10,25,50,100,200,300")
@@ -137,16 +155,29 @@ def main():
         pc = pool[pool.country_norm == c].reset_index(drop=True)
         log(f"== {c}: S1 {len(s1c):,}  pool {len(pc):,}")
 
-        # ---- features (5 groups, capped for generation + full for re-ranking)
+        # ---- features (capped for generation + full for re-ranking)
         Fp, Fs = build_features(pc, a.workers), build_features(s1c, a.workers)
-        M, info = {}, {}
+        M, info, Bcap = {}, {}, {}
         for g in B.GROUPS:
-            A_cap, B_cap, A_full, B_full, info[g] = B.weighted(Fs[g], Fp[g], a.max_df)
+            A_cap, B_cap, A_full, B_full, info[g], a_norm = B.weighted(Fs[g], Fp[g], a.max_df)
             M[g] = {"A_cap": A_cap, "BT_cap": B_cap.T.tocsr(), "A_full": A_full, "B_full": B_full}
-            del B_cap
+            Bcap[g] = B_cap
+            if g == "name":
+                med = float(np.median(a_norm[a_norm > 0])) if (a_norm > 0).any() else 1.0
+                name_info = np.clip(a_norm / med, a.info_floor, 1.0).astype(np.float32)
         del Fp, Fs
+        # candidate slices: records without an address, records with a non-Latin name
+        noaddr = np.flatnonzero(pc.address_missing.to_numpy(bool))
+        nonlatin = np.flatnonzero(~pc.name_script.isin(["latin", "none"]).to_numpy())
+        sub = {"noaddr": {"idx": noaddr, **{f"BT_{g}": Bcap[g][noaddr].T.tocsr() for g in ("name", "phon", "cname")}},
+               "nonlatin": {"idx": nonlatin, **{f"BT_{g}": Bcap[g][nonlatin].T.tocsr() for g in ("phon", "cphon", "addr")}}}
+        del Bcap
+        info["name_informativeness"] = {"median_norm": round(med, 2),
+                                        "share_below_1": round(float((name_info < 1).mean()), 4),
+                                        "share_at_floor": round(float((name_info <= a.info_floor).mean()), 4)}
+        info["slices"] = {"noaddr": int(len(noaddr)), "nonlatin": int(len(nonlatin))}
         build_info[c] = info
-        log(f"   features built {info}")
+        log(f"   features built; slices {info['slices']}")
 
         # ---- exact passes
         ex = {}
@@ -159,11 +190,16 @@ def main():
 
         # ---- generation + union + re-ranking in workers, chunked
         B.G.clear()
-        B.G.update(M=M, exact=ex, n_pool=len(pc),
+        B.G.update(M=M, exact=ex, n_pool=len(pc), sub=sub, name_info=name_info,
+                   pool_addr_missing=pc.address_missing.to_numpy(bool),
+                   prf={"seeds": a.prf_seeds, "min_priority": a.prf_min, "alpha": a.prf_alpha},
                    k={"sparse_comb": a.k_comb, "sparse_name": a.k_name, "sparse_addr": a.k_addr,
-                      "char_name": a.k_char_name, "char_addr": a.k_char_addr},
+                      "char_name": a.k_char_name, "char_addr": a.k_char_addr, "sparse_phon": a.k_phon,
+                      "sparse_cross": a.k_cross, "noaddr_name": a.k_noaddr,
+                      "nonlatin_phon": a.k_nonlatin, "expand_prf": a.k_prf},
                    w={"name": a.w_name, "addr": a.w_addr, "cross": a.w_cross, "cname": a.w_cname,
-                      "caddr": a.w_caddr, "exact": a.w_exact})
+                      "caddr": a.w_caddr, "exact": a.w_exact,
+                      "missing_addr_factor": a.missing_addr_factor})
         pos_of = {e: i for i, e in enumerate(pc.entity_id)}
         with Pool(a.workers) as wp:
             for ci_, lo in enumerate(range(0, len(s1c), a.chunk)):
@@ -212,7 +248,7 @@ def main():
                         true_rows.append(T)
                 log(f"   chunk {ci_}: S1 {lo:,}-{hi:,}  union {len(cand):,}  kept {len(shard):,}")
         B.G.clear()
-        del M
+        del M, sub
 
     if tsv is not None:
         tsv.close()
@@ -227,7 +263,7 @@ def main():
                                           "max": int(S.n_cand.max())}}
     if labeled and true_rows:
         report.update(evaluate(S, pd.concat(true_rows, ignore_index=True), budgets, a.final_budget,
-                               out_dir, s1, pool))
+                               out_dir, s1, pool, a.dump_misses))
     with open(out_dir / "report.json", "w", encoding="utf-8") as f:
         json.dump(report, f, indent=1, default=str)
     write_summary(report, out_dir / "summary.md")
@@ -236,7 +272,34 @@ def main():
 
 # ============================================================================ evaluation
 
-def evaluate(S, T, budgets, final_budget, out_dir, s1, pool):
+def categorise(miss: pd.DataFrame, s1i: pd.DataFrame, pli: pd.DataFrame) -> pd.Series:
+    """Label each missed true pair with its most likely cause (first rule that applies)."""
+    def toks(v):
+        return set(v.split()) if isinstance(v, str) and v else set()
+    cats = []
+    for r in miss.itertuples():
+        a, b = s1i.loc[r.s1_id], pli.loc[r.other_id]
+        name_ov = bool(toks(a.name_core) & toks(b.name_core))
+        phon_ov = bool(toks(a.name_phon) & toks(b.name_phon))
+        addr_ov = bool(toks(a.address_tokens_norm) & toks(b.address_tokens_norm))
+        same_addr = isinstance(a.address_tokens_norm, str) and a.address_tokens_norm == b.address_tokens_norm
+        if np.isfinite(r.rank):
+            c = "ranked_out_same_address" if same_addr else "ranked_out"
+        elif r.other_addr_missing:
+            c = "addr_missing_name_overlap" if (name_ov or phon_ov) else "addr_missing_no_name_overlap"
+        elif r.cross_script:
+            c = "cross_script_phon_overlap" if phon_ov else "cross_script_no_phon_overlap"
+        elif not (name_ov or phon_ov):
+            c = "name_changed_address_only" if addr_ov else "no_shared_word"
+        elif not addr_ov:
+            c = "name_only_address_differs"
+        else:
+            c = "weak_name_and_address"
+        cats.append(c)
+    return pd.Series(cats, index=miss.index)
+
+
+def evaluate(S, T, budgets, final_budget, out_dir, s1, pool, dump_n=2000):
     rep = {"true_pairs": int(len(T)), "true_pairs_not_in_country_pool": int((~T.in_pool).sum()),
            "by_budget": {}}
     T["rank"] = T["rank"].fillna(np.inf)
@@ -271,13 +334,18 @@ def evaluate(S, T, budgets, final_budget, out_dir, s1, pool):
         seg: {str(k): {"pairs": int(len(g)), "recall": round(float(g.found.mean()), 5)}
               for k, g in T.groupby(seg)}
         for seg in ("country", "source", "cross_script", "other_addr_missing", "bucket")}
-    # misses dump
-    miss = T[~T.found]
-    miss = miss.sample(n=min(300, len(miss)), random_state=1) if len(miss) else miss
+    # misses: categorise ALL of them, dump a sample
     s1i = s1.set_index("entity_id")
     pli = pool.set_index("entity_id")
+    miss = T[~T.found].copy()
+    miss["category"] = categorise(miss, s1i, pli) if len(miss) else []
+    rep["miss_categories_at_final_budget"] = {
+        "misses": int(len(miss)),
+        "share_of_true_pairs": {k: round(v / len(T), 5) for k, v in miss.category.value_counts().items()}}
+    miss = miss.sample(n=min(dump_n, len(miss)), random_state=1) if len(miss) else miss
     cols = ["name_core", "name_phon", "address_tokens_norm"]
-    dump = miss[["s1_id", "other_id", "country", "rank", "passes", "cross_script", "other_addr_missing"]].copy()
+    dump = miss[["s1_id", "other_id", "country", "category", "rank", "passes", "cross_script",
+                 "other_addr_missing"]].copy()
     for col in cols:
         dump[f"s1_{col}"] = dump.s1_id.map(s1i[col])
         dump[f"other_{col}"] = dump.other_id.map(pli[col])
@@ -298,6 +366,11 @@ def write_summary(r, path):
         L.append("\n## Passes (recall alone / unique recall)\n")
         for p, v in r["passes"].items():
             L.append(f"- {p}: alone {v['recall_alone']}, unique {v['unique_recall']}")
+        mc = r.get("miss_categories_at_final_budget", {})
+        if mc:
+            L.append(f"\n## Misses at final budget by cause ({mc['misses']:,} misses; share of ALL true pairs)\n")
+            for k, v in mc["share_of_true_pairs"].items():
+                L.append(f"- {k}: {v}")
         L.append("\n## Recall at final budget by segment\n```")
         for seg, d in r["segments_at_final_budget"].items():
             L.append(f"{seg}: " + ", ".join(f"{k}={v['recall']} ({v['pairs']:,})" for k, v in d.items()))
