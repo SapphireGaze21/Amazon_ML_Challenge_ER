@@ -33,11 +33,21 @@ Scale: every worker writes its own candidate shard and returns only small summar
 candidate rows travel back to the main process); pool features can be cached on disk with
 --feature-cache so the val and train runs (same pool) build them once.
 
+Checkpointing: each worker writes its own shard file per sub-batch
+(cand-dir/run/{country}_{lo:09d}.parquet). Before dispatching a sub-batch, the driver skips it
+if that shard already exists, so re-running the SAME command after a crash or a stopped space
+picks up where it left off instead of redoing finished work. For --split test, completed S1
+ranges are also appended to {out-dir}/run/tsv_done.txt as they finish, and candidate_pairs.tsv
+lines are written in that same order on completion, so a resumed run does not duplicate or
+reorder rows. Delete the run's folders in --cand-dir and --out-dir to force a clean restart
+(or pass --no-resume).
+
 Usage
   python src/phase5_blocking.py --split val --s1-sample 50000      # quick experiment
   python src/phase5_blocking.py --split val  --feature-cache data_cache
   python src/phase5_blocking.py --split train --s1-sample 400000 --feature-cache data_cache
   python src/phase5_blocking.py --split test --feature-cache data_cache
+  # interrupted? just run the exact same command again - finished shards are skipped
 """
 
 import argparse
@@ -93,6 +103,49 @@ def pool_features(pc: pd.DataFrame, workers: int, cache_dir, key: str, rebuild: 
     return F
 
 
+def shard_path(cand_dir: Path, country: str, lo: int) -> Path:
+    return cand_dir / f"{country}_{lo:09d}"
+
+
+def shard_exists(cand_dir: Path, country: str, lo: int) -> bool:
+    p = shard_path(cand_dir, country, lo)
+    return p.with_suffix(".parquet").exists() or p.with_suffix(".tsv.gz").exists()
+
+
+def read_shard_summary(cand_dir: Path, country: str, lo: int, hi: int, s1_ids_lohi: np.ndarray,
+                       s1_ids_range: np.ndarray, other_ids_range: np.ndarray) -> tuple:
+    """On resume: recover n_cand (per S1 position in [lo, hi), in s1_ids_lohi order) and, for
+    the true pairs whose S1 falls in this range (s1_ids_range / other_ids_range, aligned), their
+    rank/passes - all by reading the already-written shard instead of recomputing candidates."""
+    p = shard_path(cand_dir, country, lo)
+    if not (p.with_suffix(".parquet").exists() or p.with_suffix(".tsv.gz").exists()):
+        return (np.zeros(hi - lo, np.int64), np.full(len(s1_ids_range), -1, np.int64),
+                np.zeros(len(s1_ids_range), np.int64))
+    df = read_table(p)
+    n_by_id = df.groupby("s1_id").size().to_dict()
+    n_cand = np.array([n_by_id.get(sid, 0) for sid in s1_ids_lohi], np.int64)
+    if len(s1_ids_range):
+        key = pd.DataFrame({"s1_id": s1_ids_range, "cand_id": other_ids_range, "i": np.arange(len(s1_ids_range))})
+        m = key.merge(df[["s1_id", "cand_id", "rank", "passes"]], on=["s1_id", "cand_id"], how="left")
+        m = m.sort_values("i")
+        rank = m["rank"].fillna(-1).to_numpy(np.int64)
+        passes = m["passes"].fillna(0).to_numpy(np.int64)
+    else:
+        rank, passes = np.zeros(0, np.int64), np.zeros(0, np.int64)
+    return n_cand, rank, passes
+
+
+def read_shard_tsv(cand_dir: Path, country: str, lo: int, hi: int, s1c: pd.DataFrame, final_budget: int) -> str:
+    p = shard_path(cand_dir, country, lo)
+    ids = s1c.entity_id.to_numpy()[lo:hi]
+    if not (p.with_suffix(".parquet").exists() or p.with_suffix(".tsv.gz").exists()):
+        return "".join(f"{sid}\t\n" for sid in ids)
+    df = read_table(p)
+    keep = df[df["rank"] < final_budget]
+    lists = keep.groupby("s1_id")["cand_id"].apply(",".join).to_dict()
+    return "".join(f"{sid}\t{lists.get(sid, '')}\n" for sid in ids)
+
+
 def emit_worker(bounds):
     """Runs in a worker: block S1 rows [lo, hi), write the trimmed candidates straight to a
     shard, and return only small arrays (union sizes, ranks of true pairs, TSV lines)."""
@@ -124,7 +177,7 @@ def emit_worker(bounds):
         df = pd.DataFrame({"s1_id": g["s1_ids"][s1[keep]], "cand_id": g["pool_ids"][cand[keep]],
                            "passes": passes[keep], "priority": out["priority"][keep],
                            "rank": rank[keep], **{c: out[c][keep] for c in B.COS_COLS}})
-        write_table(df, g["shard_dir"] / f"{g['country']}_{lo:09d}")
+        write_table(df, shard_path(g["shard_dir"], g["country"], lo))
         res["kept"] = int(keep.sum())
 
     if g["final_budget"]:                                   # test: candidate_pairs.tsv lines
@@ -186,6 +239,8 @@ def main():
     ap.add_argument("--sub", type=int, default=2_000, help="S1 rows per worker task (lower = less memory)")
     ap.add_argument("--feature-cache", default=None, help="folder to cache pool features in")
     ap.add_argument("--rebuild-cache", action="store_true")
+    ap.add_argument("--no-resume", action="store_true",
+                    help="ignore existing shards/progress and redo everything")
     ap.add_argument("--workers", type=int, default=os.cpu_count())
     ap.add_argument("--seed", type=int, default=23)
     a = ap.parse_args()
@@ -221,7 +276,7 @@ def main():
         tsv = open(out_dir / "candidate_pairs.tsv", "w", encoding="utf-8")
         tsv.write("source1_entity_id\tcandidate_entity_ids\n")
 
-    true_rows, s1_rows, build_info = [], [], {}
+    true_rows, s1_rows, build_info, resumed_countries = [], [], {}, []
     for c in countries:
         s1c = s1[s1.country_norm == c].reset_index(drop=True)
         pc = pool[pool.country_norm == c].reset_index(drop=True)
@@ -290,21 +345,43 @@ def main():
         n_cand = np.zeros(len(s1c), np.int64)
         t_rank = np.full(len(t_s1), -1, np.int64)
         t_pass = np.zeros(len(t_s1), np.int64)
-        bounds = [(x, min(x + a.sub, len(s1c))) for x in range(0, len(s1c), a.sub)]
-        done, kept, next_log = 0, 0, 0.1
+        all_bounds = [(x, min(x + a.sub, len(s1c))) for x in range(0, len(s1c), a.sub)]
+        todo, already_done = [], []
+        for lo, hi in all_bounds:
+            (already_done if (not a.no_resume and shard_exists(cand_dir, c, lo)) else todo).append((lo, hi))
+        s1_ids_arr = s1c.entity_id.to_numpy()
+        t_other_arr = np.asarray(t_other, dtype=object)
+        if already_done:
+            resumed_countries.append(c)
+            log(f"   resume: {len(already_done):,}/{len(all_bounds):,} sub-batches already on disk, skipping "
+                f"(shards keep only rank < budget_max={a.budget_max}, so 'all'/union stats for this "
+                f"country's resumed portion are capped at budget_max, not the true unbounded union)")
+            for lo, hi in already_done:
+                i0, i1 = np.searchsorted(t_s1, lo), np.searchsorted(t_s1, hi)
+                nc, tr, tp = read_shard_summary(cand_dir, c, lo, hi, s1_ids_arr[lo:hi],
+                                                s1_ids_arr[t_s1[i0:i1]], t_other_arr[i0:i1])
+                n_cand[lo:hi] = nc
+                t_rank[i0:i1], t_pass[i0:i1] = tr, tp
+        done, kept, next_log = sum(h - l for l, h in already_done), 0, 0.1
+        tsv_lines = {} if tsv is not None else None
         with Pool(a.workers) as wp:
-            for res in wp.imap_unordered(emit_worker, bounds):
+            for res in wp.imap_unordered(emit_worker, todo):
                 n_cand[res["lo"]:res["hi"]] = res["n_union"]
                 if "t0" in res:
                     t_rank[res["t0"]:res["t1"]] = res["t_rank"]
                     t_pass[res["t0"]:res["t1"]] = res["t_passes"]
-                if tsv is not None:
-                    tsv.write(res["tsv"])
+                if tsv_lines is not None:
+                    tsv_lines[res["lo"]] = res["tsv"]
                 kept += res["kept"]
                 done += res["hi"] - res["lo"]
                 if done / len(s1c) >= next_log:
                     log(f"   {done:,}/{len(s1c):,} S1 done, {kept:,} candidates written")
                     next_log += 0.1
+        if tsv is not None:
+            for lo, hi in already_done:
+                tsv_lines[lo] = read_shard_tsv(cand_dir, c, lo, hi, s1c, a.final_budget)
+            for lo, _ in all_bounds:
+                tsv.write(tsv_lines[lo])
 
         # ---- evaluation bookkeeping (small)
         s1_rows.append(pd.DataFrame({
@@ -330,18 +407,30 @@ def main():
         log(f"wrote {out_dir / 'candidate_pairs.tsv'}")
 
     S = pd.concat(s1_rows, ignore_index=True)
+    resume_note = (
+        "Resumed from on-disk shards for: " + ", ".join(resumed_countries) + ". Shards only "
+        "persist candidates with rank < budget_max=" + str(a.budget_max) + ", so for these "
+        "countries the 'all' row, any --budgets entry above budget_max, and the top-level "
+        "candidates_per_s1_union stat reflect what was WRITTEN (<= budget_max), not the true "
+        "unbounded union. Every budget <= budget_max is exact. For exact unbounded numbers, "
+        "delete these countries' shards and rerun (or pass --no-resume)."
+    ) if resumed_countries else None
     report = {"args": vars(a), "run": run, "features": build_info, "s1": int(len(S)),
               "note": "budget 'all' = full union of all passes (not trimmed)",
+              "resume_note": resume_note,
               "candidates_per_s1_union": {"mean": round(float(S.n_cand.mean()), 1),
                                           "p50": float(S.n_cand.median()),
                                           "p99": float(S.n_cand.quantile(0.99)),
                                           "max": int(S.n_cand.max())}}
     if labeled and true_rows:
-        report.update(evaluate(S, pd.concat(true_rows, ignore_index=True), budgets, a.final_budget,
-                               out_dir, s1, pool, a.dump_misses))
+        eval_budgets = [b for b in budgets if b <= a.budget_max] if resumed_countries else budgets
+        report.update(evaluate(S, pd.concat(true_rows, ignore_index=True), eval_budgets, a.final_budget,
+                               out_dir, s1, pool, a.dump_misses, include_all=not resumed_countries))
     with open(out_dir / "report.json", "w", encoding="utf-8") as f:
         json.dump(report, f, indent=1, default=str)
     write_summary(report, out_dir / "summary.md")
+    if resume_note:
+        log(f"NOTE: {resume_note}")
     log(f"done -> {out_dir}")
 
 
@@ -374,13 +463,13 @@ def categorise(miss: pd.DataFrame, s1i: pd.DataFrame, pli: pd.DataFrame) -> pd.S
     return pd.Series(cats, index=miss.index)
 
 
-def evaluate(S, T, budgets, final_budget, out_dir, s1, pool, dump_n=2000):
+def evaluate(S, T, budgets, final_budget, out_dir, s1, pool, dump_n=2000, include_all=True):
     rep = {"true_pairs": int(len(T)), "true_pairs_not_in_country_pool": int((~T.in_pool).sum()),
            "by_budget": {}}
     T["rank"] = T["rank"].fillna(np.inf)
     T["passes"] = T["passes"].fillna(0).astype(int)
     total_pool = float(S.pool_size.sum())
-    for b in budgets + [10 ** 9]:
+    for b in (budgets + [10 ** 9]) if include_all else budgets:
         found = T["rank"] < b
         per = T.assign(f=found).groupby("s1_id")["f"].agg(["sum", "count"])
         r = (per["sum"] / per["count"]).reindex(S.s1_id).fillna(-1).to_numpy()   # -1 = singleton
@@ -431,6 +520,8 @@ def evaluate(S, T, budgets, final_budget, out_dir, s1, pool, dump_n=2000):
 def write_summary(r, path):
     L = [f"# Blocking run `{r['run']}`\n", f"S1 evaluated: {r['s1']:,}",
          f"Candidates per S1 before budget: {r['candidates_per_s1_union']}"]
+    if r.get("resume_note"):
+        L.insert(1, f"\n**⚠ {r['resume_note']}**\n")
     if "by_budget" in r:
         L.append("\n## Recall and oracle F0.5 by per-S1 budget\n")
         L.append("| budget | pair recall | macro S1 recall | S1 all found | oracle F0.5 | cand/S1 mean | p99 | reduction |")
