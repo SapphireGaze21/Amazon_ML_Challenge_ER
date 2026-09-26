@@ -8,8 +8,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from represent import (LEGAL_SUFFIX_HAND, REPR_COLUMNS, SubstitutionMiner,  # noqa: E402
-                       build_repr, deleet, init_config, merge_single_letters,
-                       phonetic_key, split_core, split_glued)
+                       build_repr, deleet, init_config, merge_maps, merge_single_letters,
+                       phonetic_key, split_core, split_glued, suffix_like)
 from romanize import romanize  # noqa: E402
 
 ROMAN = [
@@ -43,7 +43,7 @@ CORE = [  # tokens -> (core, removed_legal, removed_honorific)
     (["smith", "and", "sons", "llc"], (["smith", "sons"], ["llc"], [])),
     (["the", "acme", "company"], (["acme"], ["company"], [])),
     (["llc", "vision", "partners", "of", "jamaica"],                              # P2
-     (["vision", "partners", "of", "jamaica"], ["llc"], [])),
+     (["vision", "partners", "jamaica"], ["llc"], [])),                        # P3: "of" dropped
     (["seven", "consultancy", "limited", "service"],                              # P2
      (["seven", "consultancy", "service"], ["limited"], [])),
     (["shri", "balaji", "traders", "limited"], (["balaji", "traders"], ["limited"], ["shri"])),  # P1
@@ -81,6 +81,16 @@ def run():
         check(f"split_core({toks})", split_core(toks, LEGAL_SUFFIX_HAND), exp)
     for fn, arg, exp in MISC:
         check(f"{fn.__name__}({arg!r})", fn(arg), exp)
+    # P3: discovery must keep abbreviations / legal variants and reject descriptors
+    for t in ("pa", "ei", "pra", "limtid", "elelpi"):
+        check(f"suffix_like({t})", suffix_like(t, LEGAL_SUFFIX_HAND), True)
+    for t in ("bakery", "church", "school", "trust", "jean", "sport", "shop", "samiti"):
+        check(f"not suffix_like({t})", suffix_like(t, LEGAL_SUFFIX_HAND), False)
+    mm, dropped = merge_maps({"keralam": "kerala"}, {"kerala": "keralam", "mh": "maharashtra"})
+    check("merge_maps no reversal", mm, {"keralam": "kerala", "mh": "maharashtra"})
+    check("merge_maps chain", merge_maps({}, {"a": "b", "b": "c"})[0], {"a": "c", "b": "c"})
+    check("french articles", split_core(["comite", "des", "fetes", "de", "lille"], LEGAL_SUFFIX_HAND)[0],
+          ["comite", "fetes", "lille"])
     for native in ("elaelpi", "limitet", "praivet"):                              # P1 native legal
         check(f"legal list has {native}", native in LEGAL_SUFFIX_HAND, True)
 
