@@ -22,6 +22,38 @@ Design, driven by Phase 4 and the first blocking run (val_s50000):
                + w_cname*cos_cname + w_caddr*cos_caddr + w_exact*[any exact key]
   The five cosines are stored with the candidates (useful matcher features later).
 
+  v3 additions (from the val_s50000 misses: cross-script 86% and address-missing 86% recall,
+  vs 97% elsewhere; half of all misses were ranked out, not unfound):
+    phon group + sparse_phon pass   phonetic keys and phonetic pairs alone (typos, scripts)
+    slice passes                    top-K restricted to pool records whose address is missing
+                                    (noaddr_name) and to non-Latin names (nonlatin_phon). In the
+                                    full pool these compete with Latin/addressed records that
+                                    share exact words, so they lose their top-K slots; within
+                                    their slice they do not. This is the per-segment budget:
+                                    the segments are properties of the CANDIDATE, so the extra
+                                    budget is given to candidate slices, not to S1s.
+    fairer re-ranking               name evidence = max(cos_name, cos_phon); a candidate with no
+                                    address gets its address terms imputed from its name
+                                    evidence (x missing_addr_factor) instead of zero
+    expand_prf pass                 pseudo-relevance feedback / transitive expansion: the query
+                                    of each S1 is extended with its strongest candidates
+                                    (seeds) and retrieval is repeated, which finds records that
+                                    resemble a sibling match more than the S1 itself.
+
+  v3 changes driven by the val_s50000_v2 misses:
+    name informativeness   cosine gives a one-word name 1.0 for an exact match whether the word
+                           is rare or appears 20,000 times, so hundreds of "ventures" outranked
+                           a true match with an IDENTICAL address. Name terms are now scaled per
+                           S1 by clip(name IDF norm / country median, floor, 1).
+    sparse_cross pass      descriptor swaps ("black technology" vs "black services") with a
+                           truncated address share only first word + number/city: the cross
+                           features alone, not diluted inside the combined score.
+    coarse phonetics       transliterated English ("imphrastrakchar", "haitek") differs from the
+                           Latin key by 1-2 letters: coarse keys merge c/k/q, m/n, b/v, j/g and a
+                           final -ng; the cphon group adds char 3-grams over the coarse keys.
+    PRF expansion          available (--k-prf) but off by default: recall is flat across match
+                           counts, so misses are not sibling-lookalikes.
+
 Everything runs per country (Phase 0: 0 of 6.1M true pairs cross countries). Generation,
 union and re-ranking all happen inside the worker processes.
 """
@@ -39,9 +71,11 @@ DIM_BITS = 24
 DIM = 1 << DIM_BITS  # 16.7M hash buckets; collisions only add a few spurious candidates
 _MASK = DIM - 1
 
-GROUPS = ["name", "addr", "cross", "cname", "caddr"]
+GROUPS = ["name", "addr", "cross", "cname", "caddr", "phon", "cphon"]
 PASSES = ["exact_sorted", "exact_concat", "exact_alias", "sparse_comb", "sparse_name",
-          "sparse_addr", "char_name", "char_addr"]
+          "sparse_addr", "char_name", "char_addr", "sparse_phon", "noaddr_name",
+          "nonlatin_phon", "expand_prf", "sparse_cross"]
+NAME_GROUPS = ("name", "phon", "cphon")
 PASS_BIT = {p: 1 << i for i, p in enumerate(PASSES)}
 EXACT_MASK = PASS_BIT["exact_sorted"] | PASS_BIT["exact_concat"] | PASS_BIT["exact_alias"]
 COS_COLS = [f"cos_{g}" for g in GROUPS]
@@ -73,12 +107,40 @@ def address_features(norm, nums, comps) -> list[str]:
     return f
 
 
+_COARSE = str.maketrans({"c": "k", "q": "k", "m": "n", "b": "v", "j": "g"})
+
+
+def coarse_key(k: str) -> str:
+    """Coarser phonetic key for transliterated English: c/k/q, m/n (anusvara), b/v (Bengali),
+    j/g merged, repeats collapsed, a final -ng reduced to -n ("injiniyarin" ~ "engineering")."""
+    t = k.translate(_COARSE)
+    out = [t[0]] if t else []
+    for ch in t[1:]:
+        if ch != out[-1]:
+            out.append(ch)
+    t = "".join(out)
+    return t[:-1] if t.endswith("ng") and len(t) > 2 else t
+
+
+def phon_features(phon, max_pair_tokens: int = 6) -> list[str]:
+    pk = list(dict.fromkeys(_s(phon).split()))
+    ck = list(dict.fromkeys(coarse_key(k) for k in pk))
+    up, uc = sorted(pk)[:max_pair_tokens], sorted(ck)[:max_pair_tokens]
+    return (["q:" + k for k in pk] + ["qb:" + a + "|" + b for a, b in combinations(up, 2)] +
+            ["qc:" + k for k in ck] + ["qcb:" + a + "|" + b for a, b in combinations(uc, 2)])
+
+
+def cphon_text(phon) -> str:
+    return " ".join(coarse_key(k) for k in _s(phon).split())
+
+
 def cross_features(core, norm, max_keys: int = 4, max_addr: int = 12) -> list[str]:
     """Name key x address word. Name key = phonetic key (robust to spelling/script), or the
     word itself when it has no key (short words like 'om', 'sai', numbers)."""
     keys = []
     for t in dict.fromkeys(_s(core).split()):
-        k = phonetic_key(t) or (t if len(t) >= 2 else None)
+        pk = phonetic_key(t)
+        k = coarse_key(pk) if pk else (t if len(t) >= 2 else None)
         if k and k not in keys:
             keys.append(k)
     addr = [t for t in dict.fromkeys(_s(norm).split()) if len(t) >= 2][:max_addr]
@@ -102,11 +164,16 @@ def feature_chunk(rows):
     Returns {group: (lengths, indices)} of hashed, de-duplicated features."""
     acc = {g: ([], []) for g in GROUPS}
     for core, phon, norm, nums, comps, concat in rows:
+        concat = _s(concat)
+        if len(concat) >= 10 and concat.endswith("com"):      # "superagrocom" -> "superagro"
+            concat = concat[:-3]
         feats = {"name": name_features(core, phon),
                  "addr": address_features(norm, nums, comps),
                  "cross": cross_features(core, norm),
                  "cname": char_features(concat, "cn:"),
-                 "caddr": char_features(norm, "ca:")}
+                 "caddr": char_features(norm, "ca:"),
+                 "phon": phon_features(phon),
+                 "cphon": char_features(cphon_text(phon), "cq:")}
         for g, fl in feats.items():
             h = sorted({_hash(x) for x in fl})
             acc[g][0].append(len(h))
@@ -139,8 +206,10 @@ def weighted(A_raw: sp.csr_matrix, B_raw: sp.csr_matrix, max_df: int):
             normalize(X, norm="l2", copy=False)
             out.append(X)
     A_cap, B_cap, A_full, B_full = out
+    sq = sp.csr_matrix((idf[A_raw.indices] ** 2, A_raw.indices, A_raw.indptr), shape=A_raw.shape)
+    a_norm = np.sqrt(np.asarray(sq.sum(axis=1)).ravel()).astype(np.float32)
     info = {"features_in_pool": int((df > 0).sum()), "dropped_for_generation": int((df > max_df).sum())}
-    return A_cap, B_cap, A_full, B_full, info
+    return A_cap, B_cap, A_full, B_full, info, a_norm
 
 
 # ============================================================================ worker
@@ -194,33 +263,93 @@ def rank_within(s1: np.ndarray, priority: np.ndarray) -> tuple[np.ndarray, np.nd
     return o, rank.astype(np.int32)
 
 
+def priority_of(cos: dict, passes: np.ndarray, cand_addr_missing: np.ndarray, w: dict,
+                info: np.ndarray) -> np.ndarray:
+    """Re-ranking score.
+    - name evidence = max(name, phonetic, coarse-phonetic) cosine (transliterations are not
+      punished for spelling), scaled by the S1 name's informativeness (a common one-word name
+      matching exactly is weak evidence);
+    - when the CANDIDATE has no address, the address terms are imputed from the name evidence
+      (x missing_addr_factor) instead of counting as 0."""
+    name_ev = np.maximum(np.maximum(cos["name"], cos["phon"]), cos["cphon"]) * info
+    addr_terms = w["addr"] * cos["addr"] + w["cross"] * cos["cross"] + w["caddr"] * cos["caddr"]
+    imputed = w["missing_addr_factor"] * (w["addr"] + w["cross"] + w["caddr"]) * name_ev
+    addr_terms = np.where(cand_addr_missing, imputed, addr_terms)
+    return (w["name"] * name_ev + addr_terms + w["cname"] * cos["cname"] * info
+            + w["exact"] * info * ((passes & EXACT_MASK) > 0)).astype(np.float32)
+
+
 # Worker globals: set in the parent before the Pool is created, inherited by fork.
 G = {}
 
 
+def _slice_topk(C: sp.csr_matrix, k: int, lo: int, idx: np.ndarray):
+    r, c = topk_rows(C, k, lo)
+    return r, idx[c]
+
+
+def _score_union(parts, lo, hi):
+    s1, cand, passes = union_pairs(parts, G["n_pool"])
+    M = G["M"]
+    cos = {g: rowdot(M[g]["A_full"], M[g]["B_full"], s1, cand) for g in GROUPS}
+    pr = priority_of(cos, passes, G["pool_addr_missing"][cand], G["w"], G["name_info"][s1])
+    return s1, cand, passes, cos, pr
+
+
 def block_worker(bounds):
-    """Generate candidates for S1 rows [lo, hi), union them, re-rank with full cosines.
-    Returns the full ranked union as a dict of arrays."""
+    """Generate candidates for S1 rows [lo, hi), union them, re-rank with full cosines,
+    expand from the strongest candidates (PRF), re-rank again. Returns the ranked union."""
     lo, hi = bounds
-    k, w, M = G["k"], G["w"], G["M"]
+    k, w, M, SUB = G["k"], G["w"], G["M"], G["sub"]
     parts = []
-    C = {g: M[g]["A_cap"][lo:hi] @ M[g]["BT_cap"] for g in GROUPS}
-    comb = C["name"] * w["name"] + C["addr"] * w["addr"] + C["cross"] * w["cross"]
+
+    # ---- stage 1: generation
+    A = {g: M[g]["A_cap"][lo:hi] for g in GROUPS}
+    C = {g: A[g] @ M[g]["BT_cap"] for g in GROUPS}
+    info = sp.diags(G["name_info"][lo:hi])
+    comb = (info @ C["name"]) * w["name"] + C["addr"] * w["addr"] + C["cross"] * w["cross"]
+    phon = C["phon"] + C["cphon"]
     for name, mat in (("sparse_comb", comb), ("sparse_name", C["name"]), ("sparse_addr", C["addr"]),
-                      ("char_name", C["cname"]), ("char_addr", C["caddr"])):
-        if k[name] > 0:
-            parts.append((name,) + topk_rows(mat, k[name], lo))
-    del C, comb
+                      ("char_name", C["cname"]), ("char_addr", C["caddr"]), ("sparse_phon", phon),
+                      ("sparse_cross", C["cross"])):
+        if k.get(name, 0) > 0:
+            parts.append((name,) + topk_rows(mat.tocsr(), k[name], lo))
+    del C, comb, phon
+    if k.get("noaddr_name", 0) > 0 and len(SUB["noaddr"]["idx"]):
+        T = SUB["noaddr"]
+        Cs = A["name"] @ T["BT_name"] + A["phon"] @ T["BT_phon"] + A["cname"] @ T["BT_cname"]
+        parts.append(("noaddr_name",) + _slice_topk(Cs, k["noaddr_name"], lo, T["idx"]))
+    if k.get("nonlatin_phon", 0) > 0 and len(SUB["nonlatin"]["idx"]):
+        T = SUB["nonlatin"]
+        Cs = A["phon"] @ T["BT_phon"] + A["cphon"] @ T["BT_cphon"] + A["addr"] @ T["BT_addr"]
+        parts.append(("nonlatin_phon",) + _slice_topk(Cs, k["nonlatin_phon"], lo, T["idx"]))
     for name, (r, c) in G["exact"].items():            # r is sorted
         i0, i1 = np.searchsorted(r, lo), np.searchsorted(r, hi)
         parts.append((name, r[i0:i1].astype(np.int64), c[i0:i1].astype(np.int64)))
 
-    s1, cand, passes = union_pairs(parts, G["n_pool"])
-    cos = {g: rowdot(M[g]["A_full"], M[g]["B_full"], s1, cand) for g in GROUPS}
-    priority = sum(w[g] * cos[g] for g in GROUPS) + w["exact"] * ((passes & EXACT_MASK) > 0)
-    o, rank = rank_within(s1, priority)
+    s1, cand, passes, cos, pr = _score_union(parts, lo, hi)
+
+    # ---- stage 2: pseudo-relevance feedback from the strongest candidates
+    if k.get("expand_prf", 0) > 0 and len(s1):
+        o, rank = rank_within(s1, pr)
+        seed = o[(rank < G["prf"]["seeds"]) & (pr[o] >= G["prf"]["min_priority"])]
+        if len(seed):
+            rows = (s1[seed] - lo).astype(np.int64)
+            cnt = np.bincount(rows, minlength=hi - lo).astype(np.float32)
+            S = sp.csr_matrix((1.0 / cnt[rows], (rows, cand[seed])), shape=(hi - lo, G["n_pool"]))
+            has = cnt > 0
+            prf = None
+            for g, wg in (("name", w["name"]), ("addr", w["addr"]), ("cross", w["cross"])):
+                Q = A[g] + G["prf"]["alpha"] * (S @ M[g]["B_full"])
+                part = (Q @ M[g]["BT_cap"]) * wg
+                prf = part if prf is None else prf + part
+            prf = sp.diags(has.astype(np.float32)) @ prf     # only S1s that had seeds
+            parts.append(("expand_prf",) + topk_rows(prf.tocsr(), k["expand_prf"], lo))
+            s1, cand, passes, cos, pr = _score_union(parts, lo, hi)
+
+    o, rank = rank_within(s1, pr)
     out = {"s1": s1[o].astype(np.int32), "cand": cand[o].astype(np.int32),
-           "passes": passes[o], "priority": priority[o].astype(np.float32), "rank": rank}
+           "passes": passes[o], "priority": pr[o], "rank": rank}
     for g in GROUPS:
         out[f"cos_{g}"] = cos[g][o]
     return out
