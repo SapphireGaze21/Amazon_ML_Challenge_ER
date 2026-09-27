@@ -642,7 +642,10 @@ def main():
     variants = json.loads(res_path.read_text()) if res_path.exists() else {}
 
     def record(name, p, extra=None):
-        P8.atomic_table(pd.DataFrame({"p": p}), cdir / f"valp_{name}")
+        # Keep IDs with probabilities.  Downstream stacking must never assume that two cached
+        # tables have identical row order after a merge, shard resume, or feature rebuild.
+        P8.atomic_table(pd.DataFrame({"s1_id": V["s1"], "cand_id": V["cand"], "p": p}),
+                        cdir / f"valp_{name}")
         variants[name] = {**evaluate_variant(name, p, V), **(extra or {})}
         P8.atomic_json(res_path, variants)
 
@@ -858,6 +861,10 @@ def main():
         p = np.mean([np.mean(v, axis=0) for v in by_kind.values()], axis=0).astype(np.float32)
         s1, cand = TE["s1_id"].to_numpy(dtype=object), TE["cand_id"].to_numpy(dtype=object)
         grp = TE["address_missing_cand"].to_numpy().astype(np.int8)
+        # Raw, pre-calibration scores are a checkpoint for later stacked models.  Candidate-list
+        # submissions cannot be inverted to scores, and row order alone is not a safe join key.
+        # Keeping explicit IDs makes any future layer verify one-to-one alignment before reuse.
+        P8.atomic_table(pd.DataFrame({"s1_id": s1, "cand_id": cand, "p": p}), cdir / "test_pred")
         test_s1 = read_table(Path(a.block_dir) / "test_source1", columns=["entity_id", "country_norm"])
         country_of = test_s1.set_index("entity_id")["country_norm"]
         row_country = pd.Series(s1).map(country_of).to_numpy(dtype=object)
