@@ -67,7 +67,11 @@ CROSS = ["p1", "p1_rank", "p1_ratio", "p1_max_other", "p1_sum_other", "n_conf_ot
          # what KIND of number difference: truncation (noise) vs one-digit substitution
          "num_prefix_match", "num_edit1", "num_best_sim", "n_house_s1", "n_house_cand",
          # name ambiguity: how many businesses share this exact name (address-missing misses)
-         "exact_sorted_name", "s1_name_n_s1", "cand_name_n_s1", "cand_name_n_pool"]
+         "exact_sorted_name", "s1_name_n_s1", "cand_name_n_s1", "cand_name_n_pool",
+         # global address ambiguity: an exact address is much stronger when it is rare; missing
+         # addresses are deliberately no evidence, never a shared pseudo-address.
+         "exact_norm_address", "exact_addr_unique_pool", "s1_addr_n_s1",
+         "cand_addr_n_s1", "cand_addr_n_pool"]
 
 
 def log(msg):
@@ -275,7 +279,7 @@ def evaluate_variant(name, p, V):
 G = {}
 
 
-EMPTY_REC = (frozenset(), frozenset(), frozenset(), set(), None, "")
+EMPTY_REC = (frozenset(), frozenset(), frozenset(), set(), None, "", "")
 
 
 def _parse(store, pos):
@@ -287,7 +291,10 @@ def _parse(store, pos):
         postal = P8_postal(nums)
         at = frozenset((cols["address_tokens_norm"][k] or "").split())
         out.append((frozenset((cols["name_core"][k] or "").split()), frozenset((cols["name_phon"][k] or "").split()),
-                    at, nums - ({postal} if postal else set()), postal, cols["name_sorted_key"][k] or ""))
+                    at, nums - ({postal} if postal else set()), postal, cols["name_sorted_key"][k] or "",
+                    # Preserve the normalized address string, rather than a token set, for exact
+                    # global frequency.  Empty remains an explicit no-evidence value.
+                    cols["address_tokens_norm"][k] or ""))
     return out
 
 
@@ -295,6 +302,20 @@ def name_frequencies(store):
     """Exact-name (sorted core key) counts among S1 records and among the S2+S3 pool of a split.
     Both tables are complete for train and for test, so the feature means the same in both."""
     keys = pd.Series(store.take("name_sorted_key", np.arange(store.n)), dtype=object)
+    is_s1 = np.empty(store.n, bool)
+    is_s1[store.order] = np.char.startswith(store.sorted_ids, "S1-")
+    ok = keys.notna() & (keys != "")
+    return (keys[ok & is_s1].value_counts().to_dict(), keys[ok & ~is_s1].value_counts().to_dict())
+
+
+def address_frequencies(store):
+    """Exact normalized-address counts, separately for S1 and the candidate pool.
+
+    Address absence is not a key: it is excluded before counting so all missing-address records
+    never become artificial siblings.  These are global unsupervised statistics and therefore
+    have the same definition on train, validation, and test (including France).
+    """
+    keys = pd.Series(store.take("address_tokens_norm", np.arange(store.n)), dtype=object)
     is_s1 = np.empty(store.n, bool)
     is_s1[store.order] = np.char.startswith(store.sorted_ids, "S1-")
     ok = keys.notna() & (keys != "")
@@ -337,6 +358,7 @@ def _jac(a, b):
 def cross_chunk(df: pd.DataFrame) -> pd.DataFrame:
     """df: rows (s1_id, cand_id, p1) for complete S1 groups -> cross-candidate features."""
     store, nf_s1, nf_pool = G["store"], G["nf_s1"], G["nf_pool"]
+    af_s1, af_pool = G["af_s1"], G["af_pool"]
     pos, ok = store.lookup(df["cand_id"].to_numpy(dtype=object))
     up, inv = np.unique(np.where(ok, pos, 0), return_inverse=True)
     parsed = _parse(store, up)
@@ -362,7 +384,7 @@ def cross_chunk(df: pd.DataFrame) -> pd.DataFrame:
         tot = pg.sum()
         s_rec = srec[lo]
         for ii, i in enumerate(idx):
-            ni, pi_, ai, hi_, poi, ki = rec[i]
+            ni, pi_, ai, hi_, poi, ki, aki = rec[i]
             best_addr = best_same = best_num = best_post = best_name = best_phon = 0.0
             num_conf = name_num_conf = 0.0
             n_same = n_conf = 0
@@ -372,7 +394,7 @@ def cross_chunk(df: pd.DataFrame) -> pd.DataFrame:
                 if j == i:
                     continue
                 pj = pg[jj]
-                nj, pj_ph, aj, hj, poj, kj = rec[j]
+                nj, pj_ph, aj, hj, poj, kj, akj = rec[j]
                 pmax_o = max(pmax_o, pj)
                 ja = _jac(ai, aj)
                 best_addr = max(best_addr, pj * ja)
@@ -419,6 +441,13 @@ def cross_chunk(df: pd.DataFrame) -> pd.DataFrame:
             F["s1_name_n_s1"][i] = np.log1p(nf_s1.get(sk, 0)) if sk else 0.0
             F["cand_name_n_s1"][i] = np.log1p(nf_s1.get(ki, 0)) if ki else 0.0
             F["cand_name_n_pool"][i] = np.log1p(nf_pool.get(ki, 0)) if ki else 0.0
+            sak = s_rec[6]
+            exact_addr = bool(sak) and sak == aki
+            F["exact_norm_address"][i] = float(exact_addr)
+            F["exact_addr_unique_pool"][i] = float(exact_addr and af_pool.get(aki, 0) == 1)
+            F["s1_addr_n_s1"][i] = np.log1p(af_s1.get(sak, 0)) if sak else 0.0
+            F["cand_addr_n_s1"][i] = np.log1p(af_s1.get(aki, 0)) if aki else 0.0
+            F["cand_addr_n_pool"][i] = np.log1p(af_pool.get(aki, 0)) if aki else 0.0
     out = pd.DataFrame(F)
     out.insert(0, "cand_id", df["cand_id"].to_numpy())
     out.insert(0, "s1_id", df["s1_id"].to_numpy())
@@ -437,6 +466,7 @@ def cross_features(df: pd.DataFrame, store, workers: int, chunk_s1: int = 20000)
     order = d["_o"].to_numpy()
     if G.get("store") is not store or "nf_s1" not in G:
         G["nf_s1"], G["nf_pool"] = name_frequencies(store)
+        G["af_s1"], G["af_pool"] = address_frequencies(store)
     G["store"] = store
     ctx = mp.get_context("fork" if sys.platform.startswith("linux") else "spawn")
     if ctx.get_start_method() == "fork" and workers > 1:
