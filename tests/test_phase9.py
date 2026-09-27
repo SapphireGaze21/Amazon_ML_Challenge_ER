@@ -35,6 +35,8 @@ def run():
     recs["name_phon"] = recs["name_core"]
     recs["address_missing"] = False
     P.G["store"] = Store(recs)
+    P.G["nf_s1"], P.G["nf_pool"] = P.name_frequencies(P.G["store"])
+    P.G["af_s1"], P.G["af_pool"] = P.address_frequencies(P.G["store"])
     df = pd.DataFrame({"s1_id": ["s"] * 4, "cand_id": ["c1", "c2", "c3", "c4"], "p1": [0.95, 0.9, 0.2, 0.1]})
     f = P.cross_chunk(df).set_index("cand_id")
     check("weird name, same address as confident matches -> high sibling address evidence",
